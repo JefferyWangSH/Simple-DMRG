@@ -1,123 +1,155 @@
 import time
 import numpy as np
-from numpy.core.multiarray import datetime_as_string
 from scipy.sparse import kron, identity
 from scipy.sparse.linalg import eigsh  # Lanczos routine from ARPACK
 from matplotlib import pyplot as plt
 
+'''
+Simple infinite dmrg codes for simulations of 1d xxz Heisenberg chain.
+The program is implemented by conventional dmrg algorithm, with no fabrications of MPS states.
+
+TODO:
+    1. Measurements of observable quantities.
+    2. Matirx product state (MPS) implementation. 
+'''
 
 J = 1
 Sz = np.array([[0.5, 0], [0, -0.5]], dtype='d')
 Splus = np.array([[0, 1], [0, 0]], dtype='d')
 model_d = 2
 
-LatticeLength = 100
-MaximalStates = 20
 
 class Block:
-    len = 1
-    dim = model_d
-    ham = np.zeros((dim, dim), dtype='d')
-    sz = np.array([[0.5, 0], [0, -0.5]], dtype='d')
-    splus = np.array([[0, 1], [0, 0]], dtype='d')
- 
+    'Block structure for dmrg simulation'
 
-def enlarge_block():
-    # Enlarge each block by a single site.
+    def __init__(self, single_site_dim=2):
+        self.len = 1
+        self.dim = single_site_dim
+        self.ham = np.zeros((self.dim, self.dim), dtype='d')
+        self.density_matrix = np.zeros((self.dim, self.dim), dtype='d')
+        self.sz = np.array([[0.5, 0], [0, -0.5]], dtype='d')
+        self.splus = np.array([[0, 1], [0, 0]], dtype='d')
 
-    # update block hamiltonian
-    sysBlock.ham = kron(sysBlock.ham, identity(model_d, dtype='d')) \
-                 + J / 2 * ( kron(sysBlock.splus, Splus.conjugate().transpose()) + kron(sysBlock.splus.conjugate().transpose(), Splus) ) \
-                 + J * kron(sysBlock.sz, Sz)
-    envBlock.ham = kron(identity(model_d, dtype='d'), envBlock.ham) \
-                 + J / 2 * ( kron(Splus, envBlock.splus.conjugate().transpose()) + kron(Splus.conjugate().transpose(), envBlock.splus) ) \
-                 + J * kron(Sz, envBlock.sz)
+
+    def enlarge_block(self, enlarge_dirt):
+        '''
+        Enlarge each block by a single site.
+        In our convention, we enlarge the 'self' block from right in case of enlarge_dirt = 1,
+        and from left when enlarge_dirt = -1.
+        '''
+        assert(abs(enlarge_dirt) == 1.0)
+
+        # update block hamiltonian and operators.
+        if enlarge_dirt == +1:
+            self.ham = kron(self.ham, identity(model_d, dtype='d')) \
+                     + 0.5 * J * ( kron(self.splus, Splus.conjugate().transpose()) + kron(self.splus.conjugate().transpose(), Splus) ) \
+                     + J * kron(self.sz, Sz)
+            self.splus = kron(identity(self.dim, dtype='d'), Splus)
+            self.sz = kron(identity(self.dim, dtype='d'), Sz)
+            self.dim *= model_d
+            self.len += 1
+
+        if enlarge_dirt == -1:
+            self.ham = kron(identity(model_d, dtype='d'), self.ham) \
+                     + 0.5 * J * ( kron(Splus, self.splus.conjugate().transpose()) + kron(Splus.conjugate().transpose(), self.splus) ) \
+                     + J * kron(Sz, self.sz)
+            self.splus = kron(Splus, identity(self.dim, dtype='d'))
+            self.sz = kron(Sz, identity(self.dim, dtype='d'))
+            self.dim *= model_d
+            self.len += 1
+
+
+    def form_super_block(self, block):
+        '''
+        This member function constructs the Hamiltonian of super block,
+        and diagonalize to obtain ground state wavefunction |psi0> and energy e0.
+        Mind that the superblock is formed in such a way that characterized by |self> * |block>
+        '''
+        assert(isinstance(block, Block))
+
+        # Construct the Hamiltonian of super block
+        # including noninteracting part and interaction between blocks
+        superblock_hamiltonian = kron(self.ham, identity(block.dim, dtype='d')) + kron(identity(self.dim, dtype='d'), block.ham) \
+            + 0.5 * J * ( kron(self.splus, block.splus.conjugate().transpose()) + kron(self.splus.conjugate().transpose(), block.splus) ) \
+            + J * kron(self.sz, block.sz)
+        
+        # Diagonalize super hamiltonian
+        # Call ARPACK to find the superblock ground state.  ("SA" means find the
+        # "smallest in amplitude" eigenvalue.)
+        # psi0 corresponds to ground state wavefunction
+        (energy,), psi0 = eigsh(superblock_hamiltonian, k=1, which="SA")
+        return energy, psi0
+
+
+    def rotate_and_truncate(self):
+        # Diagonalize the reduced density matrix and sort the eigenvectors by
+        # eigenvalue.
+        evals, evecs = np.linalg.eigh(self.density_matrix)
     
-    # update operator for each block
-    sysBlock.splus = kron(identity(sysBlock.dim, dtype='d'), Splus)
-    sysBlock.sz = kron(identity(sysBlock.dim, dtype='d'), Sz)
-    envBlock.splus = kron(Splus, identity(envBlock.dim, dtype='d'))
-    envBlock.sz = kron(Sz, identity(envBlock.dim, dtype='d'))
+        possible_eigenstates = []
+        for eval, evec in zip(evals, evecs.transpose()):
+            possible_eigenstates.append((eval, evec))
+        possible_eigenstates.sort(reverse=True, key=lambda x: x[0])  # largest eigenvalue first
 
-    sysBlock.dim *= model_d
-    envBlock.dim *= model_d
-    sysBlock.len += 1
-    envBlock.len += 1  
+        # Build the transformation matrix from the `MaximalStates` overall most significant
+        # eigenvectors.
+        m = min(len(possible_eigenstates), MaximalStates)
+        transformation_matrix = np.zeros((self.dim, m), dtype='d', order='F')
+        for i, (eval, evec) in enumerate(possible_eigenstates[:m]):
+            transformation_matrix[:, i] = evec
 
-    return sysBlock, envBlock
+        truncation_error = 1 - sum([x[0] for x in possible_eigenstates[:m]])
 
-
-def form_super_block():
-    # Construct the Hamiltonian of super block
-    # noninteracting part and interaction between blocks
-    superblock_hamiltonian = kron(sysBlock.ham, identity(envBlock.dim, dtype='d')) + kron(identity(sysBlock.dim, dtype='d'), envBlock.ham) \
-            + J / 2 * ( kron(sysBlock.splus, envBlock.splus.conjugate().transpose()) + kron(sysBlock.splus.conjugate().transpose(), envBlock.splus) ) \
-            + J * kron(sysBlock.sz, envBlock.sz)
-
-    # Diagonalize super hamiltonian
-    # Call ARPACK to find the superblock ground state.  ("SA" means find the
-    # "smallest in amplitude" eigenvalue.)
-    # psi0 corresponds to ground state wavefunction
-    (energy,), psi0 = eigsh(superblock_hamiltonian, k=1, which="SA")
-    return energy, psi0
+        # Rotate to the low-energy subspace
+        self.dim = m
+        self.ham = transformation_matrix.conjugate().transpose().dot(self.ham.dot(transformation_matrix))
+        self.sz = transformation_matrix.conjugate().transpose().dot(self.sz.dot(transformation_matrix))
+        self.splus = transformation_matrix.conjugate().transpose().dot(self.splus.dot(transformation_matrix))
+    
+        return truncation_error
 
 
-def compute_reduced_density_matrix(psi):
+
+def compute_reduced_density_matrix(sys, env, psi):
     # Construct the reduced density matrix of the system by tracing out the 
     # environment
     # we want to make the (sys, env) indices correspond to (row, column) of a
     # matrix, respectively.
-    psi = psi.reshape([sysBlock.dim, envBlock.dim], order="C")
+    assert(isinstance(sys, Block))
+    assert(isinstance(env, Block))
+
+    psi = psi.reshape([sys.dim, env.dim], order="C")
     
     # reduced density matrix \rho = Tr_E |psi><psi|
-    sysRho = np.dot(psi, psi.conjugate().transpose())
-    envRho = np.dot(psi.conjugate().transpose(), psi)
-    return sysRho, envRho
+    sys.density_matrix = np.dot(psi, psi.conjugate().transpose())
+    env.density_matrix = np.dot(psi.conjugate().transpose(), psi)
 
 
-def rotate_and_truncate(rho, block):
-    # Diagonalize the reduced density matrix and sort the eigenvectors by
-    # eigenvalue.
-    evals, evecs = np.linalg.eigh(rho)
-    
-    possible_eigenstates = []
-    for eval, evec in zip(evals, evecs.transpose()):
-        possible_eigenstates.append((eval, evec))
-    possible_eigenstates.sort(reverse=True, key=lambda x: x[0])  # largest eigenvalue first
-
-    # Build the transformation matrix from the `MaximalStates` overall most significant
-    # eigenvectors.
-    m = min(len(possible_eigenstates), MaximalStates)
-    transformation_matrix = np.zeros((block.dim, m), dtype='d', order='F')
-    for i, (eval, evec) in enumerate(possible_eigenstates[:m]):
-        transformation_matrix[:, i] = evec
-
-    truncation_error = 1 - sum([x[0] for x in possible_eigenstates[:m]])
-
-    # Rotate to the low-energy subspace
-    block.dim = m
-    block.ham = transformation_matrix.conjugate().transpose().dot(block.ham.dot(transformation_matrix))
-    block.sz = transformation_matrix.conjugate().transpose().dot(block.sz.dot(transformation_matrix))
-    block.splus = transformation_matrix.conjugate().transpose().dot(block.splus.dot(transformation_matrix))
-    
-    return block, truncation_error
-
-
-def single_dmrg_step(sysBlock, envBlock):
+def single_dmrg_step(sys, env):
     """
     Performs a single DMRG step using `sys` as the system and `env` as the
     environment, keeping a maximum of `MaximalStates` states in the new basis.
     """
-    enlarge_block()
-    energy, psi0 = form_super_block()
-    sysRho, envRho = compute_reduced_density_matrix(psi=psi0)
-    sysBlock, sys_truncation_error = rotate_and_truncate(rho=sysRho, block=sysBlock)
-    envBlock, env_truncation_error = rotate_and_truncate(rho=envRho, block=envBlock)
+    assert(isinstance(sys, Block))
+    assert(isinstance(env, Block))
+
+    sys.enlarge_block(+1)
+    env.enlarge_block(-1)
+    energy, psi0 = sys.form_super_block(env)
+    compute_reduced_density_matrix(sys, env, psi0)
+    sys_truncation_error = sys.rotate_and_truncate()
+    env_truncation_error = env.rotate_and_truncate()
 
     return energy, 0.5 * (sys_truncation_error + env_truncation_error)
 
 
 def infinite_system_dmrg(sys, env):
+    '''
+    Subroutine to perform one signle infinite dmrg simulation 
+    '''
+    assert(isinstance(sys, Block))
+    assert(isinstance(env, Block))
+
     data_list = []
     while (sys.len + env.len) < LatticeLength:
         energy, truncation_error = single_dmrg_step(sys, env)
@@ -127,7 +159,11 @@ def infinite_system_dmrg(sys, env):
 
 if __name__ == "__main__":
 
-    sysBlock, envBlock = Block(), Block()
+    LatticeLength = 100
+    MaximalStates = 20
+
+    sysBlock = Block(single_site_dim=model_d)
+    envBlock = Block(single_site_dim=model_d)
 
     start_time = time.time()
     data = infinite_system_dmrg(sys=sysBlock, env=envBlock)
@@ -144,3 +180,4 @@ if __name__ == "__main__":
     plt.xlabel("${L}$")
     plt.ylabel("${E/L}$")
     plt.show()
+    
